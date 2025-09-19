@@ -1,0 +1,7 @@
+# Generated package analysis outputs
+*package_analysis_results*
+
+# General transient files
+*.log
+*.tmp
+~$*

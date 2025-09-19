@@ -27,5 +27,9 @@ Combine GitHub + local:
 ```
 Other
 ```powershell
-.\Analyze-GitHubPackages.ps1 -LocalReposRoot 'D:\works'  -GitHubUser gitHubUser -GitHubToken 'YOUR_TOKEN' -MaxRepos 150 -IncludeForks -IncludeArchived
+.\Analyze-GitHubPackages.ps1 -LocalReposRoot 'D:\works' -GitHubOrg gitHubOrganization -GitHubToken 'YOUR_TOKEN_with_organization_permissions' -MaxRepos 150 -IncludeForks -IncludeArchived -PackageListFile '.\list_npm_package.txt' -MatchesOnly
 ```
+
+### Copilot Instructions
+
+See `COPILOT_INSTRUCTIONS.md` for full AI / Copilot contribution guidelines and a ready-to-copy prompt.

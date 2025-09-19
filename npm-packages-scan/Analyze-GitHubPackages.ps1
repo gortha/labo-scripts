@@ -21,13 +21,16 @@ Features:
 Usage examples: Scan only local:
 .\Analyze-GitHubPackages.ps1 -LocalReposRoot 'D:\clones' -LocalOnly -PackageListFile '.\list_npm_package.txt'  -MaxRepos 150
 Combine GitHub + local:
-.\Analyze-GitHubPackages.ps1 -GitHubUser gitHubUser -GitHubToken YOUR_TOKEN -LocalReposRoot 'D:\clones' -IncludeForks -IncludeArchived  -MaxRepos 150
+.\Analyze-GitHubPackages.ps1 -GitHubUser gitHubUser -GitHubToken YOUR_TOKEN -LocalReposRoot 'D:\clones' -IncludeForks -IncludeArchived  -MaxRepos 150 -MatchesOnly
+wITH GitHubOrg:
+.\Analyze-GitHubPackages.ps1 -GitHubOrg gitHubOrg -GitHubToken YOUR_TOKEN -IncludeForks -IncludeArchived  -MaxRepos 150 -MatchesOnly
 #>
 
 param(
   [string]$GitHubUser = 'gitHubUser',
-  [string]$PackageListFile = 'D:\scripts\list_npm_package.txt',
-  [string]$OutputFile = 'D:\scripts\package_analysis_results.txt',
+  [string]$GitHubOrg = $null,
+  [string]$PackageListFile = '.\list_npm_package.txt',
+  [string]$OutputFile = '.\package_analysis_results.txt',
   [string]$GitHubToken = $null,
   [int]$MaxRepos = 0,
   [switch]$IncludeForks,
@@ -144,12 +147,55 @@ function Get-LocalFile {
 # Version helpers
 function Parse-PackageListLine {
   param([string]$Line)
-  if ($Line -match '^\s*([@A-Za-z0-9._\-\/]+)\s*(?:\(([^)]+)\))?\s*$'){
+  if (-not $Line -or ($Line.Trim()).Length -eq 0) { return $null }
+
+  $raw = $Line.Trim()
+
+  # 1. Parentheses syntax: name (spec[, spec2])
+  if ($raw -match '^\s*([@A-Za-z0-9._\-\/]+)\s*(?:\(([^)]+)\))?\s*$'){
     $name=$matches[1]
     $ver=$null
     if ($matches[2]) { $ver = $matches[2].Trim() }
-    [PSCustomObject]@{ Name=$name; VersionSpec=$ver }
+    $name = $name.TrimEnd(',')
+    return [PSCustomObject]@{ Name=$name; VersionSpec=$ver }
   }
+
+  # Helper to clean individual version tokens
+  function _CleanVer([string]$t){
+    if (-not $t) { return $null }
+    $c=$t.Trim().Trim(',')
+    if ($c -match '^@([~^=><]*[0-9])'){ $c = $c.Substring(1) }
+    if ($c -eq '') { return $null }
+    return $c
+  }
+
+  # 2. name@v1, v2, @v3 (multi versions after @)
+  if ($raw -match '^(?<name>[@A-Za-z0-9._\-\/]+)@(?<vers>.+)$'){
+    $name=$matches['name']
+    $versRaw=$matches['vers']
+    # Split on commas into candidate versions
+    $parts = $versRaw -split ',' | ForEach-Object { _CleanVer $_ }
+    $parts = $parts | Where-Object { $_ }
+    $verSpec = ($parts -join ', ')
+    return [PSCustomObject]@{ Name=$name; VersionSpec=$verSpec }
+  }
+
+  # 3. name <whitespace> version(s)  (e.g. scoped name followed by single version)
+  if ($raw -match '^(?<name>[@A-Za-z0-9._\-\/]+)\s+(?<vers>[~^=><]*[0-9][0-9A-Za-z+\-.]*\s*(,\s*[@~^=><]*[0-9][0-9A-Za-z+\-.]*)*)$'){
+    $name=$matches['name']
+    $versRaw=$matches['vers']
+    $parts = $versRaw -split ',' | ForEach-Object { _CleanVer $_ }
+    $parts = $parts | Where-Object { $_ }
+    $verSpec = ($parts -join ', ')
+    return [PSCustomObject]@{ Name=$name; VersionSpec=$verSpec }
+  }
+
+  # 4. Fallback: line is only the package name (presence only)
+  if ($raw -match '^[@A-Za-z0-9._\-\/]+$') {
+    return [PSCustomObject]@{ Name=$raw; VersionSpec=$null }
+  }
+
+  $null
 }
 function Normalize-Version {
   param([string]$v)
@@ -175,6 +221,16 @@ function Test-VersionSpec {
   if (-not $Spec){ return $true }
   if (-not $Actual){ return $false }
   $Spec=$Spec.Trim()
+  # Allow comma-separated list of alternative specs (logical OR)
+  if ($Spec -match ',') {
+    foreach($part in ($Spec -split ',')) {
+      $p=$part.Trim()
+      if ($p) {
+        if (Test-VersionSpec -Spec $p -Actual $Actual) { return $true }
+      }
+    }
+    return $false
+  }
   if ($Spec -eq '*'){ return $true }
   if ($Spec -match '^\^(\d+)(\.(\d+))?(\.(\d+))?'){
     $base=Normalize-Version $Spec; $act=Normalize-Version $Actual
@@ -261,17 +317,25 @@ function Parse-YarnLock {
       if ($first -and $first -notmatch '^(version|resolved|integrity)$'){ $null=$set.Add($first) }
     }
   }
-  $set.ToArray()
+  # PowerShell 5.1 may not expose ToArray() directly; enumerate instead
+  @($set)
 }
 
 function Get-Repositories {
-  param([string]$User)
+  param([string]$User,[string]$Org)
   if ($LocalOnly) { return @() }
+  $isOrg = -not [string]::IsNullOrEmpty($Org)
+  $targetName = if ($isOrg) { $Org } else { $User }
   if (-not $GitHubToken){
-    Write-DebugLine "Using REST for repositories"
+    $scope = if ($isOrg) { 'org' } else { 'user' }
+    Write-DebugLine "Using REST for repositories ($scope scope)"
     $list=@(); $page=1
     do{
-      $u="https://api.github.com/users/$User/repos?per_page=100&page=$page&type=all&sort=updated"
+      if ($isOrg) {
+        $u="https://api.github.com/orgs/$targetName/repos?per_page=100&page=$page&type=all&sort=updated"
+      } else {
+        $u="https://api.github.com/users/$targetName/repos?per_page=100&page=$page&type=all&sort=updated"
+      }
       $batch=Invoke-GH $u
       if ($batch){
         foreach($b in $batch){
@@ -286,13 +350,15 @@ function Get-Repositories {
     }while($batch.Count -eq 100)
     return $list
   }
-  Write-DebugLine "Using GraphQL for repositories"
+  $scope = if ($isOrg) { 'org' } else { 'user' }
+  Write-DebugLine "Using GraphQL for repositories ($scope scope)"
   $repos=@(); $cursor=$null
   while($true){
     if([string]::IsNullOrEmpty($cursor)){ $afterValue='null' } else { $afterValue='"{0}"' -f $cursor }
-    $q=@"
+    if ($isOrg) {
+      $q=@"
 query {
-  user(login: "$User") {
+  organization(login: "$targetName") {
     repositories(
       first: 100,
       after: $afterValue,
@@ -311,13 +377,41 @@ query {
   }
 }
 "@
+    } else {
+      $q=@"
+query {
+  user(login: "$targetName") {
+    repositories(
+      first: 100,
+      after: $afterValue,
+      orderBy: { field: UPDATED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        name
+        isFork
+        isArchived
+        description
+        url
+        updatedAt
+      }
+    }
+  }
+}
+"@
+    }
     $payload=@{query=$q}|ConvertTo-Json -Depth 4
     $h=@{'Authorization'="Bearer $GitHubToken";'User-Agent'='PS-Pkg-Scan';'Accept'='application/vnd.github+json'}
     try{
       $resp=Invoke-WebRequest -Uri https://api.github.com/graphql -Headers $h -Method POST -Body $payload -ContentType 'application/json'
       $json=$resp.Content|ConvertFrom-Json
-      if(-not $json.data.user){ break }
-      $data=$json.data.user.repositories
+      if ($isOrg) {
+        if(-not $json.data.organization){ break }
+        $data=$json.data.organization.repositories
+      } else {
+        if(-not $json.data.user){ break }
+        $data=$json.data.user.repositories
+      }
     }catch{ Write-Host "GraphQL request failed: $($_.Exception.Message)" -ForegroundColor Red; break }
     foreach($n in $data.nodes){
       if(-not $IncludeForks -and $n.isFork){ continue }
@@ -368,9 +462,14 @@ function Get-LocalRepos {
 
 # ----- Start -----
 Write-Host "=== GitHub + Local Package Scan ===" -ForegroundColor Green
+if ($GitHubOrg -and $GitHubUser -and $GitHubUser -ne 'gitHubUser') {
+  Write-Error "Specify either -GitHubUser or -GitHubOrg, not both."; exit 1
+}
+if ($GitHubOrg) { $GitHubUser = $null }
 if ($LocalOnly) {
   Write-Host "Mode: Local only" -ForegroundColor Cyan
 } else {
+    if ($GitHubOrg) { Write-Host "Target: Organization '$GitHubOrg'" -ForegroundColor Cyan } else { Write-Host "Target: User '$GitHubUser'" -ForegroundColor Cyan }
     if (-not $GitHubToken){ Write-Host "No token provided (remote limited to 60 req/hr)." -ForegroundColor Yellow } else { Write-Host "Token detected for remote scan." -ForegroundColor Green }
 }
 
@@ -386,7 +485,11 @@ foreach($ln in $rawLines){
 if (-not $targetObjs -or $targetObjs.Count -eq 0){ Write-Error "No valid entries in package list."; exit 1 }
 
 Write-Line "=== Package Scan ==="
-Write-Line "GitHub User: $GitHubUser"
+if ($GitHubOrg) {
+  Write-Line "GitHub Organization: $GitHubOrg"
+} elseif ($GitHubUser) {
+  Write-Line "GitHub User: $GitHubUser"
+}
 if ($LocalReposRoot) { Write-Line "Local Root: $LocalReposRoot" }
 Write-Line "Entries: $($targetObjs.Count)"
 foreach($o in $targetObjs){
@@ -404,8 +507,9 @@ Write-Line ""
 
 $remoteRepos = @()
 if (-not $LocalOnly) {
-  $remoteRepos = Get-Repositories -User $GitHubUser
-  Write-Line "Remote repositories fetched: $($remoteRepos.Count)"
+  $owner = if ($GitHubOrg) { $GitHubOrg } else { $GitHubUser }
+  $remoteRepos = Get-Repositories -User $GitHubUser -Org $GitHubOrg
+  Write-Line "Remote repositories fetched: $($remoteRepos.Count) (owner=$owner)"
 } else {
   Write-Line "Remote repositories skipped (LocalOnly)."
 }
@@ -450,10 +554,11 @@ foreach($r in $allRepos){
     $pnpmLock    = Get-LocalFile -RepoPath $r.LocalPath -Relative 'pnpm-lock.yaml'
     $yarnLock    = Get-LocalFile -RepoPath $r.LocalPath -Relative 'yarn.lock'
   } else {
-    $pkgJson     = Get-File $GitHubUser $repoName 'package.json'
-    $packageLock = Get-File $GitHubUser $repoName 'package-lock.json'
-    $pnpmLock    = Get-File $GitHubUser $repoName 'pnpm-lock.yaml'
-    $yarnLock    = Get-File $GitHubUser $repoName 'yarn.lock'
+    $owner = if ($GitHubOrg) { $GitHubOrg } else { $GitHubUser }
+    $pkgJson     = Get-File $owner $repoName 'package.json'
+    $packageLock = Get-File $owner $repoName 'package-lock.json'
+    $pnpmLock    = Get-File $owner $repoName 'pnpm-lock.yaml'
+    $yarnLock    = Get-File $owner $repoName 'yarn.lock'
   }
 
   if ($pkgJson){
@@ -589,9 +694,20 @@ foreach($r in $allRepos){
 
 Write-Line "=== Summary ==="
 Write-Line "Repos scanned (total): $($allRepos.Count)"
+if ($GitHubOrg) { Write-Line "Target organization: $GitHubOrg" } elseif ($GitHubUser) { Write-Line "Target user: $GitHubUser" }
 Write-Line "Remote repos: $($remoteRepos.Count)"
 Write-Line "Local repos: $($localRepos.Count)"
-Write-Line "Total version-satisfied matches (packages): $totalMatches"
+<#
+Recompute authoritative match total from matchedEntries to ensure the
+summary aligns with the exported matches file even if counting logic
+above changes in future (defensive consistency).
+#>
+$computedTotal = $matchedEntries.Count
+if ($computedTotal -ne $totalMatches) {
+  Write-Line "Total version-satisfied matches (packages): $computedTotal (reconciled; previous counter=$totalMatches)"
+} else {
+  Write-Line "Total version-satisfied matches (packages): $computedTotal"
+}
 if ($RequireBothVersionMatch){
   Write-Line "Version mode: BOTH required"
 } elseif ($RequireVersionMatch){
